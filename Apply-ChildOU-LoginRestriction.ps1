@@ -1,15 +1,14 @@
 <# 
   Apply-ChildOU-LoginRestriction.ps1  (PowerShell 5.1)
 
-  1) GAM -> print orgs (capture output)
-  2) Trim to CSV header+rows
-  3) Filter to DIRECT children of the base OU
-  4) For each child OU: set Chrome Sign-In restriction to allow ONLY that OU name (email)
+  For each DIRECT child OU of -BaseOUPath, set Chrome Sign-In restriction to:
+    deviceallownewusers RESTRICTED_LIST
+    userallowlist <child-ou-name email>
 
   Example:
     .\Apply-ChildOU-LoginRestriction.ps1 `
-      -BaseOUPath "\Student 1:1 Devices\00 - WLS\GR05" `
-      -GamPath "C:\GAM7\gam.exe" -DryRun
+      -BaseOUPath "\Student 1:1 Devices\01 - WMS\GR06" `
+      -GamPath "C:\GAM7\gam.exe"             # add -DryRun to simulate
 #>
 
 [CmdletBinding()]
@@ -51,7 +50,10 @@ Write-Host ""
 # 1) Export ALL OUs (capture + clean)
 Log "[1/3] Exporting all OUs (this can take a bit on large tenants)..."
 $raw = & $GamPath print orgs fields orgUnitPath,parentOrgUnitPath 2>&1
-if (-not $raw -or $raw.Count -eq 0) { throw "GAM returned no output for 'print orgs'." }
+$printExit = $LASTEXITCODE
+if ($printExit -ne 0 -or -not $raw) {
+  throw ("GAM 'print orgs' failed (exit {0})`n{1}" -f $printExit, ($raw -join "`r`n"))
+}
 
 # locate header
 $headerIndex = -1
@@ -82,13 +84,6 @@ Log ("[2/3] Found {0} direct child OUs under {1}" -f $childCount, $base)
 if ($childCount -eq 0) { Log "Nothing to do."; return }
 
 # 3) Apply policy per child OU
-# Required GAM syntax (note quotes around OU path and email):
-#   gam update chromepolicy `
-#     orgunit "<OU PATH>" `
-#     chrome.devices.SignInRestriction `
-#     deviceallownewusers RESTRICTED_LIST `
-#     userallowlist "<email>"
-
 $idx = 0
 $failures = @()
 foreach ($child in $children) {
@@ -99,29 +94,28 @@ foreach ($child in $children) {
   Log ("[3/3] ({0}/{1}) Target OU: {2}" -f $idx, $childCount, $ouPath)
   Log ("          Replace allowlist with: {0}" -f $email)
 
-  # Build ONE quoted argument string so GAM sees spaces correctly
-  $argLine = ('update chromepolicy orgunit "{0}" chrome.devices.SignInRestriction deviceallownewusers RESTRICTED_LIST userallowlist "{1}"' -f $ouPath, $email)
-
   if ($DryRun) {
-    Log ("DRY-RUN CMD > {0} {1}" -f $GamPath, $argLine)
+    Log ("DRY-RUN CMD > {0} update chromepolicy orgunit `"{1}`" chrome.devices.SignInRestriction deviceallownewusers RESTRICTED_LIST userallowlist `"{2}`"" -f $GamPath, $ouPath, $email)
     continue
   }
 
-  $errTmp = [System.IO.Path]::GetTempFileName()
-  try {
-    $p = Start-Process -FilePath $GamPath -ArgumentList $argLine -NoNewWindow -PassThru -RedirectStandardError $errTmp
-    $null = $p.WaitForExit(120000)
-    if (-not $p.HasExited) { try { $p.Kill() } catch {}; throw "GAM update timed out." }
-    if ($p.ExitCode -ne 0) {
-      $err = ""; if (Test-Path $errTmp) { $err = Get-Content $errTmp -Raw }
-      Log ("WARNING:   -> GAM returned non-zero exit code on {0} (exit {1})" -f $ouPath, $p.ExitCode)
-      if ($err) { Log ("           STDERR: {0}" -f $err.Trim()) }
-      $failures += [PSCustomObject]@{ OU=$ouPath; Email=$email; ExitCode=$p.ExitCode; Error=$err }
-    } else {
-      Log ("SUCCESS:   -> Updated policy on {0}" -f $ouPath)
-    }
-  } finally {
-    if (Test-Path $errTmp) { Remove-Item $errTmp -Force }
+  # Invoke GAM with array args; PowerShell will quote as needed; check $LASTEXITCODE
+  $out = & $GamPath `
+    update chromepolicy `
+    orgunit $ouPath `
+    chrome.devices.SignInRestriction `
+    deviceallownewusers RESTRICTED_LIST `
+    userallowlist $email 2>&1
+  $code = $LASTEXITCODE
+
+  if ($code -ne 0) {
+    Log ("WARNING:   -> GAM returned non-zero exit code on {0} (exit {1})" -f $ouPath, $code)
+    if ($out) { Log ("           OUTPUT: {0}" -f (($out -join "`n").Trim())) }
+    $failures += [PSCustomObject]@{ OU=$ouPath; Email=$email; ExitCode=$code; Output=($out -join "`n") }
+  } else {
+    # Optional: echo GAM's success line
+    if ($out) { ($out -join "`n") | Write-Host }
+    Log ("SUCCESS:   -> Updated policy on {0}" -f $ouPath)
   }
 }
 
